@@ -99,7 +99,7 @@ conda env create -f environment.yml
 conda activate facto_xtrainer
 ```
 
-依赖：`numpy`, `matplotlib`, `scipy`
+依赖：`numpy`, `matplotlib`
 
 ### 运行测试
 

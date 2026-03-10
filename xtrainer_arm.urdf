@@ -13,7 +13,7 @@ Stephen Brawner (brawner@gmail.com)
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/base_link.STL" />
+        <mesh filename="meshes/base_link.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -22,7 +22,7 @@ Stephen Brawner (brawner@gmail.com)
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/base_link.STL" />
+        <mesh filename="meshes/base_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -35,7 +35,7 @@ Stephen Brawner (brawner@gmail.com)
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J1.STL" />
+        <mesh filename="meshes/J1.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -44,7 +44,7 @@ Stephen Brawner (brawner@gmail.com)
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J1.STL" />
+        <mesh filename="meshes/J1.STL" />
       </geometry>
     </collision>
   </link>
@@ -64,7 +64,7 @@ Stephen Brawner (brawner@gmail.com)
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J2.STL" />
+        <mesh filename="meshes/J2.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -73,7 +73,7 @@ Stephen Brawner (brawner@gmail.com)
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J2.STL" />
+        <mesh filename="meshes/J2.STL" />
       </geometry>
     </collision>
   </link>
@@ -93,7 +93,7 @@ Stephen Brawner (brawner@gmail.com)
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J3.STL" />
+        <mesh filename="meshes/J3.STL" />
       </geometry>
       <material name="">
         <color rgba="0.0862745098039216 0.294117647058824 0.749019607843137 1" />
@@ -102,7 +102,7 @@ Stephen Brawner (brawner@gmail.com)
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J3.STL" />
+        <mesh filename="meshes/J3.STL" />
       </geometry>
     </collision>
   </link>
@@ -122,7 +122,7 @@ Stephen Brawner (brawner@gmail.com)
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J4.STL" />
+        <mesh filename="meshes/J4.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -131,7 +131,7 @@ Stephen Brawner (brawner@gmail.com)
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J4.STL" />
+        <mesh filename="meshes/J4.STL" />
       </geometry>
     </collision>
   </link>
@@ -151,7 +151,7 @@ Stephen Brawner (brawner@gmail.com)
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J5.STL" />
+        <mesh filename="meshes/J5.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -160,7 +160,7 @@ Stephen Brawner (brawner@gmail.com)
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J5.STL" />
+        <mesh filename="meshes/J5.STL" />
       </geometry>
     </collision>
   </link>
@@ -180,7 +180,7 @@ Stephen Brawner (brawner@gmail.com)
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J6.STL" />
+        <mesh filename="meshes/J6.STL" />
       </geometry>
       <material name="">
         <color rgba="1 1 1 1" />
@@ -189,7 +189,7 @@ Stephen Brawner (brawner@gmail.com)
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://robotics/drivers/dobot/description/meshes/xtrainer/J6.STL" />
+        <mesh filename="meshes/J6.STL" />
       </geometry>
     </collision>
   </link>

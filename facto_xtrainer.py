@@ -516,7 +516,7 @@ def test():
     
     # 测试
     start = np.array([0, 0, 0, 0, 0, 0])
-    goal = np.array([0.5, 0.3, 0.2, 0.1, 0.2, 0])
+    goal = np.array([1.5, -1.3, 2.2, 1.1, -2.2, 0.8])
     
     print("\n[1] 点对点轨迹")
     t0 = time.time()
@@ -528,7 +528,7 @@ def test():
     print("  保存: test_p2p.png")
     
     print("\n[2] 障碍物避让")
-    obstacles = [np.array([0.2, 0.1, 0.2])]
+    obstacles = [np.array([0.5, -0.5, 0.0])]
     t1 = time.time()
     traj2, info2 = facto.optimize(start, goal, obstacles=obstacles, max_iter=120)
     print(f"  迭代: {info2['iterations']}, 耗时: {time.time()-t1:.2f}s")
