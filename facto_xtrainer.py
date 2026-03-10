@@ -69,6 +69,16 @@ class XTrainerRobot:
             [-3.14, 3.14]   # J_6
         ])
         
+        # 关节速度限制 (rad/s，从 URDF <limit velocity="..."> 提取)
+        self.joint_velocity_limits = np.array([
+            10.0,  # J_1
+            10.0,  # J_2
+            10.0,  # J_3
+            10.0,  # J_4
+            10.0,  # J_5
+            10.0   # J_6
+        ])
+        
         # 碰撞球体 (从 xtrainer.yml)
         self.collision_spheres = collision_spheres or {}
         
@@ -447,14 +457,171 @@ class FACTOFull:
         return np.zeros(coeffs.size)
 
 
+class TimeParameterizer:
+    """时间参数化器 - 为几何轨迹分配变速时间
+    
+    原理：
+      FACTO 输出的是等间隔路径点（纯几何），没有时间信息。
+      本类根据「路径步长 + 曲率」自适应分配时间间隔：
+        - 步长大 → 时间长（走得远就花更多时间）
+        - 曲率大（转弯处）→ 额外减速因子 → 更慢
+        - 曲率小（直线段）→ 无减速 → 更快
+      最后用速度限制裁剪，确保不超过 URDF 关节速度限制。
+    
+    算法步骤：
+      1. 计算每段步长 s_i = max_j(|Δq_{i,j}|)
+      2. 计算曲率指标 κ_i（二阶差分的模）
+      3. 减速因子 α_i = 1 + curvature_gain * κ_norm_i
+      4. dt_i = (s_i / v_cruise_max) * α_i，然后保底
+      5. 速度裁剪 + 平滑 + 再次裁剪
+    """
+    
+    def __init__(self, velocity_limits: np.ndarray, cruise_ratio: float = 0.8,
+                 dt_min: float = 0.005, smooth_window: int = 5,
+                 curvature_gain: float = 3.0, total_time_target: float = None):
+        """
+        Args:
+            velocity_limits: 各关节速度上限 (rad/s)，长度=n_dof
+            cruise_ratio: 巡航速度占限速的比例 (0~1)
+            dt_min: 最小时间间隔 (s)，防止过快抖动
+            smooth_window: 滑动平均窗口大小（奇数）
+            curvature_gain: 曲率减速增益，越大转弯越慢
+            total_time_target: 目标总时间 (s)，None 则自动
+        """
+        self.v_max = velocity_limits
+        self.v_cruise = velocity_limits * cruise_ratio
+        self.v_cruise_max = np.max(self.v_cruise)
+        self.dt_min = dt_min
+        self.smooth_window = smooth_window
+        self.curvature_gain = curvature_gain
+        self.total_time_target = total_time_target
+    
+    def parameterize(self, traj: np.ndarray) -> dict:
+        """对轨迹进行时间参数化
+        
+        Args:
+            traj: (N, n_dof) 关节角矩阵（纯几何路径点）
+        
+        Returns:
+            dict 包含:
+              - 'trajectory': (N, n_dof) 原始路径点
+              - 'dt': (N-1,) 每段时间间隔 (s)
+              - 'timestamps': (N,) 累积时间戳 (s)
+              - 'velocities': (N-1, n_dof) 每段各关节角速度 (rad/s)
+              - 'total_time': 总时间 (s)
+              - 'max_speed_ratio': 峰值速度与限速的比值
+              - 'curvature': (N-1,) 曲率指标
+        """
+        N, n_dof = traj.shape
+        
+        # 1. 每段关节角变化量
+        dq = np.diff(traj, axis=0)  # (N-1, n_dof)
+        
+        # 2. 步长: 每段各关节变化的最大值
+        step_sizes = np.max(np.abs(dq), axis=1)  # (N-1,)
+        
+        # 3. 曲率指标: 二阶差分 → 衡量路径"弯曲程度"
+        #    ddq[i] = dq[i+1] - dq[i]，即关节角加速度
+        ddq = np.diff(dq, axis=0)  # (N-2, n_dof)
+        curvature_raw = np.linalg.norm(ddq, axis=1)  # (N-2,)
+        
+        # 在两端补值（首尾段用邻居的曲率）
+        curvature = np.zeros(N - 1)
+        if len(curvature_raw) > 0:
+            # curvature_raw 有 N-2 个值，对应 dq[0..N-3] 与 dq[1..N-2] 之间的差
+            # curvature[i] 表示第 i 段的曲率，i=0..N-2
+            # curvature_raw[i] 对应 i=0..N-3，映射到 curvature[1..N-2]
+            curvature[1:len(curvature_raw)+1] = curvature_raw
+            curvature[0] = curvature_raw[0]
+            if len(curvature_raw) + 1 < len(curvature):
+                curvature[-1] = curvature_raw[-1]
+        
+        # 4. 归一化曲率到 [0, 1]
+        kappa_max = np.max(curvature) if np.max(curvature) > 1e-10 else 1.0
+        kappa_norm = curvature / kappa_max
+        
+        # 5. 每段权重 = 步长 × (1 + curvature_gain * 归一化曲率)
+        #    步长大或曲率大的段，权重更大 → 分到更多时间
+        weights = step_sizes * (1.0 + self.curvature_gain * kappa_norm)
+        weights = np.maximum(weights, 1e-10)  # 避免零权重
+        
+        # 6. 估算合理总时间
+        if self.total_time_target is not None:
+            T_total = self.total_time_target
+        else:
+            # 自动估算: 各关节总弧长 / 巡航速度，取最忙关节
+            total_arc = np.sum(np.abs(dq), axis=0)  # (n_dof,)
+            T_total = np.max(total_arc / self.v_cruise)
+            T_total = max(T_total, 2.0)  # 至少 2.0s，保证动画可见
+        
+        # 7. 按权重分配时间
+        dt = weights / np.sum(weights) * T_total
+        
+        # 8. 保底
+        dt = np.maximum(dt, self.dt_min)
+        
+        # 9. 速度裁剪: 确保任何关节不超速
+        for i in range(N - 1):
+            for j in range(n_dof):
+                if np.abs(dq[i, j]) > 1e-12:
+                    dt_required = np.abs(dq[i, j]) / self.v_max[j]
+                    dt[i] = max(dt[i], dt_required)
+        
+        # 10. 平滑
+        dt = self._smooth(dt)
+        
+        # 11. 平滑后再次裁剪速度
+        for i in range(N - 1):
+            for j in range(n_dof):
+                if np.abs(dq[i, j]) > 1e-12:
+                    dt_required = np.abs(dq[i, j]) / self.v_max[j]
+                    dt[i] = max(dt[i], dt_required)
+        
+        # 计算累积时间戳
+        timestamps = np.zeros(N)
+        timestamps[1:] = np.cumsum(dt)
+        
+        # 计算实际角速度
+        velocities = dq / dt[:, np.newaxis]
+        
+        # 峰值速度比
+        speed_ratios = np.abs(velocities) / self.v_max[np.newaxis, :]
+        max_speed_ratio = np.max(speed_ratios)
+        
+        return {
+            'trajectory': traj,
+            'dt': dt,
+            'timestamps': timestamps,
+            'velocities': velocities,
+            'total_time': timestamps[-1],
+            'max_speed_ratio': max_speed_ratio,
+            'curvature': curvature,
+        }
+    
+    def _smooth(self, dt: np.ndarray) -> np.ndarray:
+        """滑动平均平滑时间间隔序列"""
+        w = self.smooth_window
+        if w <= 1 or len(dt) < w:
+            return dt
+        kernel = np.ones(w) / w
+        padded = np.pad(dt, (w // 2, w // 2), mode='edge')
+        smoothed = np.convolve(padded, kernel, mode='valid')[:len(dt)]
+        smoothed = np.maximum(smoothed, self.dt_min)
+        return smoothed
+
+
 def visualize(robot: XTrainerRobot, traj: np.ndarray, 
             start: np.ndarray, goal: np.ndarray,
-            obstacles: List = None, title: str = "") -> plt.Figure:
-    """可视化"""
-    fig = plt.figure(figsize=(16, 6))
+            obstacles: List = None, title: str = "",
+            time_info: dict = None) -> plt.Figure:
+    """可视化（支持时间参数化信息）"""
     
-    # 3D
-    ax1 = fig.add_subplot(121, projection='3d')
+    has_time = time_info is not None
+    n_cols = 3 if has_time else 2
+    fig = plt.figure(figsize=(6 * n_cols, 6))
+    
+    # 3D 工作空间
+    ax1 = fig.add_subplot(1, n_cols, 1, projection='3d')
     
     px, py, pz = [], [], []
     for q in traj:
@@ -484,16 +651,42 @@ def visualize(robot: XTrainerRobot, traj: np.ndarray,
     ax1.set_title('Workspace')
     ax1.legend()
     
-    # 关节空间
-    ax2 = fig.add_subplot(122)
-    tt = np.linspace(0, 1, len(traj))
+    # 关节空间 (用实际时间轴)
+    ax2 = fig.add_subplot(1, n_cols, 2)
+    if has_time:
+        tt = time_info['timestamps']
+        xlabel = 'Time (s)'
+    else:
+        tt = np.linspace(0, 1, len(traj))
+        xlabel = 'Normalized Time'
     for j in range(robot.n_dof):
         ax2.plot(tt, traj[:, j], label=f'J{j+1}')
-    ax2.set_xlabel('Time')
+    ax2.set_xlabel(xlabel)
     ax2.set_ylabel('Joint (rad)')
     ax2.set_title('Joint Space')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
+    
+    # 速度 + 时间间隔图（仅在有时间信息时）
+    if has_time:
+        ax3 = fig.add_subplot(1, n_cols, 3)
+        
+        # 上半部分：各关节速度
+        t_mid = (time_info['timestamps'][:-1] + time_info['timestamps'][1:]) / 2
+        vel = time_info['velocities']
+        for j in range(robot.n_dof):
+            ax3.plot(t_mid, vel[:, j], label=f'J{j+1}', alpha=0.8)
+        
+        # 画速度上限参考线
+        v_lim = robot.joint_velocity_limits[0]  # 假设相同
+        ax3.axhline(y=v_lim, color='r', linestyle='--', alpha=0.5, label=f'+limit ({v_lim})')
+        ax3.axhline(y=-v_lim, color='r', linestyle='--', alpha=0.5, label=f'-limit')
+        
+        ax3.set_xlabel('Time (s)')
+        ax3.set_ylabel('Joint Velocity (rad/s)')
+        ax3.set_title(f'Velocities (peak ratio={time_info["max_speed_ratio"]:.2%})')
+        ax3.legend(fontsize=7)
+        ax3.grid(True, alpha=0.3)
     
     plt.suptitle(title)
     plt.tight_layout()
@@ -514,6 +707,9 @@ def test():
     # FACTO 优化器
     facto = FACTOFull(robot, basis)
     
+    # 时间参数化器
+    timer = TimeParameterizer(robot.joint_velocity_limits, cruise_ratio=0.8)
+    
     # 测试
     start = np.array([0, 0, 0, 0, 0, 0])
     goal = np.array([1.5, -1.3, 2.2, 1.1, -2.2, 0.8])
@@ -521,9 +717,14 @@ def test():
     print("\n[1] 点对点轨迹")
     t0 = time.time()
     traj1, info1 = facto.optimize(start, goal, max_iter=100)
+    time_info1 = timer.parameterize(traj1)
     print(f"  迭代: {info1['iterations']}, 耗时: {time.time()-t0:.2f}s")
+    print(f"  总时间: {time_info1['total_time']:.4f}s")
+    print(f"  峰值速度比: {time_info1['max_speed_ratio']:.2%}")
+    print(f"  dt范围: [{time_info1['dt'].min():.5f}, {time_info1['dt'].max():.5f}]s")
     
-    fig = visualize(robot, traj1, start, goal, title="XTrainer P2P")
+    fig = visualize(robot, traj1, start, goal,
+                    title="XTrainer P2P (Time-Parameterized)", time_info=time_info1)
     plt.savefig('/home/ethanqjiang/workspace/facto_xtrainer_maxclaw/test_p2p.png', dpi=150)
     print("  保存: test_p2p.png")
     
@@ -531,9 +732,14 @@ def test():
     obstacles = [np.array([0.5, -0.5, 0.0])]
     t1 = time.time()
     traj2, info2 = facto.optimize(start, goal, obstacles=obstacles, max_iter=120)
+    time_info2 = timer.parameterize(traj2)
     print(f"  迭代: {info2['iterations']}, 耗时: {time.time()-t1:.2f}s")
+    print(f"  总时间: {time_info2['total_time']:.4f}s")
+    print(f"  峰值速度比: {time_info2['max_speed_ratio']:.2%}")
+    print(f"  dt范围: [{time_info2['dt'].min():.5f}, {time_info2['dt'].max():.5f}]s")
     
-    fig2 = visualize(robot, traj2, start, goal, obstacles, "XTrainer Obstacle")
+    fig2 = visualize(robot, traj2, start, goal, obstacles,
+                     "XTrainer Obstacle (Time-Parameterized)", time_info=time_info2)
     plt.savefig('/home/ethanqjiang/workspace/facto_xtrainer_maxclaw/test_obstacle.png', dpi=150)
     print("  保存: test_obstacle.png")
     

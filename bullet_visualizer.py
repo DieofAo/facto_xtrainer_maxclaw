@@ -18,7 +18,7 @@ import numpy as np
 import time
 import os
 
-from facto_xtrainer import XTrainerRobot, FourierBasis, FACTOFull
+from facto_xtrainer import XTrainerRobot, FourierBasis, FACTOFull, TimeParameterizer
 
 
 class BulletVisualizer:
@@ -116,16 +116,25 @@ class BulletVisualizer:
         return list(state[0])
 
     def play_trajectory(self, trajectory: np.ndarray, dt: float = 0.03,
-                        loop: bool = False):
+                        loop: bool = False, time_info: dict = None):
         """
-        播放轨迹动画
+        播放轨迹动画（支持变速播放）
 
         Args:
             trajectory: (N, n_dof) 关节角矩阵
-            dt: 帧间隔（秒），越小越快
+            dt: 等速模式的帧间隔（秒），仅在 time_info=None 时使用
             loop: 是否循环播放
+            time_info: TimeParameterizer 输出的时间参数化信息
+                       如果提供，则用变速播放（转弯慢、直线快）
         """
-        print(f"[Bullet] 播放轨迹: {len(trajectory)} 帧, dt={dt}s")
+        if time_info is not None:
+            dt_arr = time_info['dt']
+            print(f"[Bullet] 变速播放: {len(trajectory)} 帧, "
+                  f"总时间={time_info['total_time']:.3f}s, "
+                  f"dt=[{dt_arr.min():.4f}, {dt_arr.max():.4f}]s")
+        else:
+            dt_arr = None
+            print(f"[Bullet] 等速播放: {len(trajectory)} 帧, dt={dt}s")
 
         # 先画末端轨迹线
         self.add_trajectory_trail(trajectory)
@@ -140,7 +149,10 @@ class BulletVisualizer:
                 for i, q in enumerate(trajectory):
                     self.set_joint_positions(q)
                     p.stepSimulation()
-                    time.sleep(dt)
+                    if dt_arr is not None and i < len(dt_arr):
+                        time.sleep(dt_arr[i])
+                    else:
+                        time.sleep(dt)
 
                 # 终点停留
                 time.sleep(0.5)
@@ -149,10 +161,14 @@ class BulletVisualizer:
                     break
 
                 # 反向播放
-                for i, q in enumerate(reversed(trajectory)):
-                    self.set_joint_positions(q)
+                n = len(trajectory)
+                for i in range(n - 1, -1, -1):
+                    self.set_joint_positions(trajectory[i])
                     p.stepSimulation()
-                    time.sleep(dt)
+                    if dt_arr is not None and i > 0:
+                        time.sleep(dt_arr[i - 1])
+                    else:
+                        time.sleep(dt)
 
                 time.sleep(0.5)
 
@@ -189,6 +205,7 @@ def main():
     robot = XTrainerRobot()
     basis = FourierBasis(n_basis=10, n_dof=6, n_points=80)
     facto = FACTOFull(robot, basis)
+    timer = TimeParameterizer(robot.joint_velocity_limits, cruise_ratio=0.8)
 
     start = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     goal = np.array([0.5, -1.3, 1.2, 1.1, -2.2, 0.8])
@@ -202,10 +219,14 @@ def main():
     print("\n[FACTO] 规划点到点轨迹...")
     t0 = time.time()
     traj, info = facto.optimize(start, goal, obstacles=obstacles, max_iter=150)
+    time_info = timer.parameterize(traj)
     elapsed = time.time() - t0
     print(f"[FACTO] 完成: {info['iterations']} 次迭代, 耗时 {elapsed:.2f}s")
     print(f"[FACTO] 起点误差: {np.linalg.norm(traj[0] - start):.6f} rad")
     print(f"[FACTO] 终点误差: {np.linalg.norm(traj[-1] - goal):.6f} rad")
+    print(f"[FACTO] 总运动时间: {time_info['total_time']:.4f}s")
+    print(f"[FACTO] 峰值速度比: {time_info['max_speed_ratio']:.2%}")
+    print(f"[FACTO] dt范围: [{time_info['dt'].min():.5f}, {time_info['dt'].max():.5f}]s")
 
     # ---- 2. PyBullet 可视化 ----
     viz = BulletVisualizer()
@@ -219,8 +240,8 @@ def main():
     viz.set_joint_positions(start)
     time.sleep(1.0)
 
-    # 播放轨迹（循环播放，Ctrl+C 停止）
-    viz.play_trajectory(traj, dt=0.05, loop=True)
+    # 变速播放轨迹（循环播放，Ctrl+C 停止）
+    viz.play_trajectory(traj, loop=True, time_info=time_info)
 
     # 保持窗口
     viz.wait_for_exit()
