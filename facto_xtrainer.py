@@ -149,7 +149,7 @@ class XTrainerRobot:
 
 
 class FourierBasis:
-    """Fourier 基函数轨迹表示"""
+    """Fourier 基函数轨迹表示 (带缓存，避免重复计算)"""
     
     def __init__(self, n_basis: int = 10, n_dof: int = 6, n_points: int = 100):
         self.n_basis = n_basis
@@ -157,56 +157,79 @@ class FourierBasis:
         self.n_points = n_points
         self.t = np.linspace(0, 1, n_points)
         
-    def basis_matrix(self) -> np.ndarray:
-        """Fourier 基函数矩阵"""
-        Phi = np.zeros((self.n_points, self.n_basis))
+        # 预计算并缓存所有矩阵，避免每次调用都重新生成
+        self._Phi = self._build_basis_matrix()
+        self._dPhi = self._build_velocity_matrix()
+        self._d2Phi = self._build_acceleration_matrix()
+    
+    def _build_basis_matrix(self) -> np.ndarray:
+        """构建基函数矩阵: 常数 + Hermite + Fourier
         
-        for k in range(self.n_basis):
-            if k == 0:
-                Phi[:, k] = 1.0
-            else:
-                n = (k + 1) // 2
-                if k % 2 == 1:  # sin
-                    Phi[:, k] = np.sin(n * 2 * np.pi * self.t)
-                else:  # cos
-                    Phi[:, k] = np.cos(n * 2 * np.pi * self.t)
+        列布局: [1, 3t²-2t³, sin(2πt), cos(2πt), sin(4πt), cos(4πt), ...]
+        Hermite 项 h(t)=3t²-2t³ 用于打破周期性，且端点导数为0:
+          h(0)=0, h(1)=1, h'(0)=0, h'(1)=0
+        """
+        Phi = np.zeros((self.n_points, self.n_basis))
+        Phi[:, 0] = 1.0        # 常数项
+        if self.n_basis > 1:
+            Phi[:, 1] = 3*self.t**2 - 2*self.t**3  # Hermite项 (打破周期性 + 端点零速度)
+        for k in range(2, self.n_basis):
+            n = (k) // 2
+            if k % 2 == 0:  # sin
+                Phi[:, k] = np.sin(n * 2 * np.pi * self.t)
+            else:  # cos
+                Phi[:, k] = np.cos(n * 2 * np.pi * self.t)
         return Phi
+    
+    def _build_velocity_matrix(self) -> np.ndarray:
+        """构建速度基函数矩阵"""
+        dPhi = np.zeros((self.n_points, self.n_basis))
+        # k=0: d(1)/dt = 0
+        if self.n_basis > 1:
+            dPhi[:, 1] = 6*self.t - 6*self.t**2  # d(3t²-2t³)/dt = 6t-6t²
+        for k in range(2, self.n_basis):
+            n = (k) // 2
+            w = n * 2 * np.pi
+            if k % 2 == 0:  # d(sin)/dt = w*cos
+                dPhi[:, k] = w * np.cos(w * self.t)
+            else:  # d(cos)/dt = -w*sin
+                dPhi[:, k] = -w * np.sin(w * self.t)
+        return dPhi
+    
+    def _build_acceleration_matrix(self) -> np.ndarray:
+        """构建加速度基函数矩阵"""
+        d2Phi = np.zeros((self.n_points, self.n_basis))
+        # k=0: d2(1)/dt2 = 0
+        if self.n_basis > 1:
+            d2Phi[:, 1] = 6 - 12*self.t  # d2(3t²-2t³)/dt2 = 6-12t
+        for k in range(2, self.n_basis):
+            n = (k) // 2
+            w = n * 2 * np.pi
+            if k % 2 == 0:  # d2(sin)/dt2 = -w^2*sin
+                d2Phi[:, k] = -(w**2) * np.sin(w * self.t)
+            else:  # d2(cos)/dt2 = -w^2*cos
+                d2Phi[:, k] = -(w**2) * np.cos(w * self.t)
+        return d2Phi
+        
+    def basis_matrix(self) -> np.ndarray:
+        """Fourier 基函数矩阵 (缓存)"""
+        return self._Phi
     
     def coeffs_to_trajectory(self, c: np.ndarray) -> np.ndarray:
         """系数 -> 轨迹"""
-        Phi = self.basis_matrix()
-        return Phi @ c  # (n_points, n_dof)
+        return self._Phi @ c  # (n_points, n_dof)
     
     def trajectory_to_coeffs(self, traj: np.ndarray) -> np.ndarray:
         """轨迹 -> 系数"""
-        Phi = self.basis_matrix()
-        return np.linalg.lstsq(Phi, traj, rcond=None)[0]
+        return np.linalg.lstsq(self._Phi, traj, rcond=None)[0]
     
     def compute_velocity(self, c: np.ndarray) -> np.ndarray:
         """速度"""
-        n = self.n_points
-        dPhi = np.zeros((n, self.n_basis))
-        for k in range(1, self.n_basis):
-            idx = (k + 1) // 2
-            w = idx * 2 * np.pi
-            if k % 2 == 1:
-                dPhi[:, k] = w * np.cos(w * self.t)
-            else:
-                dPhi[:, k] = -w * np.sin(w * self.t)
-        return dPhi @ c
+        return self._dPhi @ c
     
     def compute_acceleration(self, c: np.ndarray) -> np.ndarray:
         """加速度"""
-        n = self.n_points
-        d2Phi = np.zeros((n, self.n_basis))
-        for k in range(1, self.n_basis):
-            idx = (k + 1) // 2
-            w = idx * 2 * np.pi
-            if k % 2 == 1:
-                d2Phi[:, k] = -(w**2) * np.sin(w * self.t)
-            else:
-                d2Phi[:, k] = -(w**2) * np.cos(w * self.t)
-        return d2Phi @ c
+        return self._d2Phi @ c
 
 
 class FACTOFull:
@@ -229,6 +252,11 @@ class FACTOFull:
         self.lam_max = 1e6
         self.lam_min = 1e-8
         
+        # 预缓存不变的雅可比矩阵
+        self._J_smooth_cache = None
+        self._J_vel_start_cache = None
+        self._J_vel_end_cache = None
+        
     def optimize(self,
                 start: np.ndarray,
                 goal: np.ndarray,
@@ -237,12 +265,20 @@ class FACTOFull:
         """
         FACTO 优化
         """
-        # 初始化: 线性插值作为初始轨迹
+        # 重置缓存和阻尼因子
+        self._J_smooth_cache = None
+        self._J_vel_start_cache = None
+        self._J_vel_end_cache = None
+        self.lam = 0.01
+        
+        # 初始化: Hermite 插值 (3t²-2t³) 作为初始轨迹
+        # 与基函数中的 Hermite 项匹配，端点速度天然为0，不会泄漏到谐波分量
         n_dof = self.robot.n_dof
         t = np.linspace(0, 1, self.basis.n_points)
+        h = 3*t**2 - 2*t**3  # Hermite 插值: h(0)=0, h(1)=1, h'(0)=0, h'(1)=0
         traj_init = np.zeros((self.basis.n_points, n_dof))
         for i in range(n_dof):
-            traj_init[:, i] = start[i] + t * (goal[i] - start[i])
+            traj_init[:, i] = start[i] + h * (goal[i] - start[i])
         
         coeffs = self.basis.trajectory_to_coeffs(traj_init)
         
@@ -264,11 +300,11 @@ class FACTOFull:
             
             coeffs_new = coeffs - delta.reshape(coeffs.shape)
             
-            # 接受/拒绝
+            # 接受/拒绝 (用残差平方和作为目标函数，而非残差和)
             traj_new = self.basis.coeffs_to_trajectory(coeffs_new)
             cost_new, _ = self._compute_cost(coeffs_new, start, goal, obstacles)
             
-            if np.sum(cost_new) < np.sum(cost):
+            if np.sum(cost_new**2) < np.sum(cost**2):
                 coeffs = coeffs_new
                 self.lam = max(self.lam / 1.5, self.lam_min)
             else:
@@ -280,7 +316,7 @@ class FACTOFull:
         
         final_traj = self.basis.coeffs_to_trajectory(coeffs)
         
-        return final_traj, {'iterations': it + 1, 'final_cost': np.sum(cost)}
+        return final_traj, {'iterations': it + 1, 'final_cost': np.sum(cost**2)}
     
     def _compute_cost(self, coeffs: np.ndarray, start: np.ndarray, goal: np.ndarray,
                      obstacles: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
@@ -292,17 +328,36 @@ class FACTOFull:
         residuals = []
         J_rows = []
         
-        # 1. 平滑度成本 (加速度平方)
-        res_smooth = acc.flatten() * 0.001
-        J_smooth = self._jacobian_smooth()
+        # 1. 平滑度成本 (加速度平方) - 权重提升到 0.1 以抑制高频波动
+        res_smooth = acc.flatten() * 0.1
+        if self._J_smooth_cache is None:
+            self._J_smooth_cache = self._jacobian_smooth()
         residuals.extend(res_smooth)
-        J_rows.append(J_smooth)
+        J_rows.append(self._J_smooth_cache)
         
-        # 2. 末端误差
-        res_end = (traj[-1] - goal) * 10
+        # 2. 末端误差 (终点) - 权重50，确保终点精度
+        res_end = (traj[-1] - goal) * 50
         J_end = self._jacobian_end(coeffs)
         residuals.extend(res_end)
         J_rows.append(J_end)
+        
+        # 2.5 起始点约束 - 权重50，确保起点精度
+        res_start = (traj[0] - start) * 50
+        J_start = self._jacobian_start(coeffs)
+        residuals.extend(res_start)
+        J_rows.append(J_start)
+        
+        # 2.6 速度边界约束 - 权重5.0，起止速度为0
+        vel = self.basis.compute_velocity(coeffs)
+        res_vel_start = vel[0] * 5.0   # 起点速度应为0
+        res_vel_end = vel[-1] * 5.0     # 终点速度应为0
+        if self._J_vel_start_cache is None:
+            self._J_vel_start_cache = self._jacobian_velocity_boundary(0)
+            self._J_vel_end_cache = self._jacobian_velocity_boundary(-1)
+        residuals.extend(res_vel_start)
+        J_rows.append(self._J_vel_start_cache)
+        residuals.extend(res_vel_end)
+        J_rows.append(self._J_vel_end_cache)
         
         # 3. 关节限制
         for i, q in enumerate(traj[::5]):  # 每5个点检查一次
@@ -336,33 +391,47 @@ class FACTOFull:
         return residual_vec, J_matrix
     
     def _jacobian_smooth(self) -> np.ndarray:
-        """平滑度雅可比"""
+        """平滑度雅可比 (使用缓存的加速度矩阵)"""
         n = self.basis.n_points
         n_dof = self.robot.n_dof
-        d2Phi = np.zeros((n, self.basis.n_basis))
-        for k in range(1, self.basis.n_basis):
-            idx = (k + 1) // 2
-            w = idx * 2 * np.pi
-            if k % 2 == 1:
-                d2Phi[:, k] = -(w**2) * np.sin(w * self.basis.t)
-            else:
-                d2Phi[:, k] = -(w**2) * np.cos(w * self.basis.t)
+        d2Phi = self.basis._d2Phi  # 直接使用缓存
         
         J = np.zeros((n * n_dof, self.basis.n_basis * n_dof))
         
         for j in range(n_dof):
-            for k in range(self.basis.n_basis):
-                J[j*n:(j+1)*n, j*self.basis.n_basis + k] = d2Phi[:, k] * 0.001
+            J[j*n:(j+1)*n, j*self.basis.n_basis:(j+1)*self.basis.n_basis] = d2Phi * 0.1
         
         return J
         
     def _jacobian_end(self, coeffs: np.ndarray) -> np.ndarray:
-        """末端雅可比"""
+        """末端雅可比（终点）"""
         n_dof = self.robot.n_dof
         J = np.zeros((n_dof, coeffs.size))
         Phi_end = self.basis.basis_matrix()[-1, :]
         for j in range(n_dof):
-            J[j, j*self.basis.n_basis:(j+1)*self.basis.n_basis] = Phi_end * 10
+            J[j, j*self.basis.n_basis:(j+1)*self.basis.n_basis] = Phi_end * 50
+        return J
+    
+    def _jacobian_start(self, coeffs: np.ndarray) -> np.ndarray:
+        """起始点雅可比 - 约束 traj[0] == start"""
+        n_dof = self.robot.n_dof
+        J = np.zeros((n_dof, coeffs.size))
+        Phi_start = self.basis.basis_matrix()[0, :]
+        for j in range(n_dof):
+            J[j, j*self.basis.n_basis:(j+1)*self.basis.n_basis] = Phi_start * 50
+        return J
+    
+    def _jacobian_velocity_boundary(self, time_idx: int) -> np.ndarray:
+        """速度边界雅可比 - 约束端点速度为0"""
+        n_dof = self.robot.n_dof
+        n_basis = self.basis.n_basis
+        
+        # 直接使用缓存的速度矩阵，保证与基函数布局一致
+        dPhi_row = self.basis._dPhi[time_idx]
+        
+        J = np.zeros((n_dof, n_basis * n_dof))
+        for j in range(n_dof):
+            J[j, j*n_basis:(j+1)*n_basis] = dPhi_row * 5.0
         return J
     
     def _jacobian_joint_violation(self, traj_idx: int, joint_idx: int, coeffs: np.ndarray) -> np.ndarray:
@@ -455,7 +524,7 @@ def test():
     print(f"  迭代: {info1['iterations']}, 耗时: {time.time()-t0:.2f}s")
     
     fig = visualize(robot, traj1, start, goal, title="XTrainer P2P")
-    plt.savefig('/workspace/facto_claw/test_p2p.png', dpi=150)
+    plt.savefig('/home/ethanqjiang/workspace/facto_xtrainer_maxclaw/test_p2p.png', dpi=150)
     print("  保存: test_p2p.png")
     
     print("\n[2] 障碍物避让")
@@ -465,7 +534,7 @@ def test():
     print(f"  迭代: {info2['iterations']}, 耗时: {time.time()-t1:.2f}s")
     
     fig2 = visualize(robot, traj2, start, goal, obstacles, "XTrainer Obstacle")
-    plt.savefig('/workspace/facto_claw/test_obstacle.png', dpi=150)
+    plt.savefig('/home/ethanqjiang/workspace/facto_xtrainer_maxclaw/test_obstacle.png', dpi=150)
     print("  保存: test_obstacle.png")
     
     plt.close('all')
