@@ -2,7 +2,7 @@
 FACTO 论文完整复现 - XTrainer 机械臂
 
 基于论文理论体系：
-1. Fourier 基函数轨迹表示
+s1. 三阶 B 样条基函数轨迹表示
 2. 函数空间自适应优化 (LM + 高斯牛顿)
 3. 约束优化 (关节限制 + 碰撞避让)
 """
@@ -13,40 +13,53 @@ from mpl_toolkits.mplot3d import Axes3D
 from typing import Tuple, List, Optional, Dict
 import time
 import xml.etree.ElementTree as ET
+import yaml
+import os
+from scipy.interpolate import BSpline as SciBSpline
+
+
+def load_collision_spheres(yml_path: str) -> Dict:
+    """从 xtrainer.yml 加载碰撞球体配置
+    
+    Returns:
+        dict: {link_name: [{center: [x,y,z], radius: float}, ...], ...}
+    """
+    with open(yml_path, 'r') as f:
+        data = yaml.safe_load(f)
+    return data.get('collision_spheres', {})
 
 
 class XTrainerRobot:
-    """XTrainer 6轴机械臂 - 从 URDF 解析"""
+    """XTrainer 6轴机械臂 - 从 URDF 解析
+    
+    FK 采用 URDF 原生变换链：
+      T_link_i = T_parent × T_origin(xyz, rpy) × Rot(axis, q_i)
+    其中 T_origin 包含关节坐标系相对父连杆的位置和姿态偏移。
+    """
     
     def __init__(self, urdf_path: str = None, collision_spheres: Dict = None):
         """从 URDF 构建机器人模型"""
         
-        # 6轴机械臂 DH 参数 (从 URDF 解析)
-        # 关节: J_1 ~ J_6
-        # 连杆: LINK_0(base) -> LINK_1 -> ... -> LINK_6(末端)
-        
         self.n_dof = 6
         
-        # DH 参数 (单位: 米)
-        # 从 URDF 提取
-        # J_1: 绕 Z 轴旋转, offset=0.2234m
-        # J_2: 绕 Y 轴旋转 (有 RPY 变换)
-        # J_3: 沿 X 轴 -0.28m
-        # J_4: 绕 Z 轴旋转, offset=-0.225m
-        # J_5: 沿 Y 轴 -0.12m  
-        # J_6: 沿 Z 轴 0.083m
+        # ---- 从 URDF 提取的关节参数 ----
+        # 每个关节的 origin: (xyz, rpy)
+        self.joint_origins = [
+            # J_1: LINK_0 -> LINK_1
+            {'xyz': [0, 0, 0.2234],       'rpy': [0, 0, 0]},
+            # J_2: LINK_1 -> LINK_2  (有 RPY 预旋转!)
+            {'xyz': [0, 0, 0],            'rpy': [1.5707963267949, 1.5707963267949, 0]},
+            # J_3: LINK_2 -> LINK_3
+            {'xyz': [-0.28, 0, 0],         'rpy': [0, 0, 0]},
+            # J_4: LINK_3 -> LINK_4  (有 RPY 预旋转!)
+            {'xyz': [-0.225, 0, 0.1175],   'rpy': [0, 0, -1.57079637654807]},
+            # J_5: LINK_4 -> LINK_5  (有 RPY 预旋转!)
+            {'xyz': [0, -0.12, 0],         'rpy': [1.5707963267949, 0, 0]},
+            # J_6: LINK_5 -> LINK_6  (有 RPY 预旋转!)
+            {'xyz': [0, 0.0829999998597296, 0], 'rpy': [-1.5707963267949, 0, 0]},
+        ]
         
-        # 各关节位置偏移 (从 URDF origin)
-        self.joint_offsets = np.array([
-            [0, 0, 0.2234],      # J_1 -> LINK_1
-            [0, 0, 0],           # J_2 -> LINK_2
-            [-0.28, 0, 0],       # J_3 -> LINK_3
-            [-0.225, 0, 0.1175],  # J_4 -> LINK_4
-            [0, -0.12, 0],       # J_5 -> LINK_5
-            [0, 0.083, 0]        # J_6 -> LINK_6
-        ])
-        
-        # 各关节轴 (从 URDF axis)
+        # 所有关节轴都是 z 轴 (URDF 中均为 <axis xyz="0 0 1"/>)
         self.joint_axes = np.array([
             [0, 0, 1],  # J_1
             [0, 0, 1],  # J_2
@@ -55,9 +68,6 @@ class XTrainerRobot:
             [0, 0, 1],  # J_5
             [0, 0, 1]   # J_6
         ])
-        
-        # 连杆长度 (简化)
-        self.link_lengths = [0.2234, 0, 0.28, 0.225, 0.12, 0.083]
         
         # 关节限制 (rad)
         self.joint_limits = np.array([
@@ -82,48 +92,137 @@ class XTrainerRobot:
         # 碰撞球体 (从 xtrainer.yml)
         self.collision_spheres = collision_spheres or {}
         
-    def dh_transform(self, theta: float, d: float, a: float, alpha: float) -> np.ndarray:
-        """标准 DH 变换"""
-        ct, st = np.cos(theta), np.sin(theta)
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        return np.array([
-            [ct, -st*ca, st*sa, a*ct],
-            [st, ct*ca, -ct*sa, a*st],
-            [0, sa, ca, d],
-            [0, 0, 0, 1]
+        # 预计算每个关节的 origin 齐次变换 (不含关节角)
+        self._T_origins = []
+        for jo in self.joint_origins:
+            self._T_origins.append(self._make_origin_transform(jo['xyz'], jo['rpy']))
+        
+    @staticmethod
+    def _rpy_to_rotation(roll: float, pitch: float, yaw: float) -> np.ndarray:
+        """RPY (XYZ 固定角) -> 3×3 旋转矩阵
+        
+        R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+        这是 URDF/ROS 的标准约定。
+        """
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        
+        R = np.array([
+            [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+            [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+            [-sp,   cp*sr,            cp*cr           ]
         ])
+        return R
     
-    def forward_kinematics(self, q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """正运动学 - 计算末端位置和姿态"""
-        
-        # 简化模型: 依次变换
+    def _make_origin_transform(self, xyz: list, rpy: list) -> np.ndarray:
+        """从 URDF joint origin 的 xyz + rpy 构建 4×4 齐次变换"""
         T = np.eye(4)
+        T[:3, :3] = self._rpy_to_rotation(rpy[0], rpy[1], rpy[2])
+        T[:3, 3] = xyz
+        return T
+    
+    @staticmethod
+    def _rot_z(angle: float) -> np.ndarray:
+        """绕 z 轴旋转的 4×4 齐次变换"""
+        c, s = np.cos(angle), np.sin(angle)
+        T = np.eye(4)
+        T[0, 0] = c;  T[0, 1] = -s
+        T[1, 0] = s;  T[1, 1] = c
+        return T
+
+    def forward_kinematics(self, q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """正运动学 - 计算末端位置和姿态
         
-        # 基础位置
-        T = self.dh_transform(0, self.joint_offsets[0, 2], 0, np.pi/2)
-        
+        变换链: T = ∏ [T_origin_i × Rz(q_i)]
+        """
+        T = np.eye(4)
         for i in range(self.n_dof):
-            # 关节变换
-            d = self.joint_offsets[i, 2] if i < len(self.joint_offsets) else 0
-            a = self.link_lengths[i] if i < len(self.link_lengths) else 0
-            alpha = 0
-            
-            # 根据 URDF 有一些特殊旋转
-            if i == 1:  # J_2
-                alpha = np.pi/2
-            elif i == 2:  # J_3
-                a = 0.28
-            elif i == 3:  # J_4
-                alpha = -np.pi/2
-            elif i == 4:  # J_5
-                alpha = np.pi/2
-            elif i == 5:  # J_6
-                alpha = -np.pi/2
-                
-            T_i = self.dh_transform(q[i], d, a, alpha)
-            T = T @ T_i
-            
+            T = T @ self._T_origins[i] @ self._rot_z(q[i])
         return T[:3, 3], T[:3, :3]
+
+    def get_link_transforms(self, q: np.ndarray) -> List[np.ndarray]:
+        """计算每个连杆在世界坐标系中的齐次变换矩阵
+        
+        T_link_i = T_origin_0 × Rz(q0) × T_origin_1 × Rz(q1) × ... × T_origin_i × Rz(qi)
+        
+        Returns:
+            list of (4,4) ndarray: T_world_link[i] 是 LINK_{i+1} 的世界变换
+        """
+        transforms = []
+        T = np.eye(4)
+        for i in range(self.n_dof):
+            T = T @ self._T_origins[i] @ self._rot_z(q[i])
+            transforms.append(T.copy())
+        return transforms
+
+    def get_all_sphere_positions(self, q: np.ndarray) -> List[Tuple[np.ndarray, float]]:
+        """给定关节角，计算所有碰撞球体在世界坐标系中的位置和半径
+        
+        Returns:
+            list of (center_world, radius): 每个球体的世界坐标中心和半径
+        """
+        return [(c, r) for c, r, _ in self.get_all_sphere_positions_with_link(q)]
+    
+    def get_all_sphere_positions_with_link(self, q: np.ndarray) -> List[Tuple[np.ndarray, float, int]]:
+        """给定关节角，计算所有碰撞球体在世界坐标系中的位置、半径和所属连杆索引
+        
+        Returns:
+            list of (center_world, radius, link_index): 
+              link_index: 0=LINK_1, 1=LINK_2, ..., 5=LINK_6
+        """
+        if not self.collision_spheres:
+            return []
+        
+        transforms = self.get_link_transforms(q)
+        # 连杆名到索引的映射: LINK_1->0, LINK_2->1, ...
+        link_map = {f'LINK_{i+1}': i for i in range(self.n_dof)}
+        
+        spheres = []
+        for link_name, sphere_list in self.collision_spheres.items():
+            idx = link_map.get(link_name)
+            if idx is None:
+                continue
+            T = transforms[idx]
+            for s in sphere_list:
+                center_local = np.array(s['center'])
+                # 齐次坐标变换
+                center_world = (T[:3, :3] @ center_local) + T[:3, 3]
+                spheres.append((center_world, s['radius'], idx))
+        
+        return spheres
+    
+    def check_self_collision(self, q: np.ndarray, safety_margin: float = 0.01,
+                             skip_adjacent: int = 1) -> bool:
+        """自碰撞检测 — 检查非相邻连杆上的球体是否互相穿透
+        
+        跳过 |link_i - link_j| <= skip_adjacent 的球体对，
+        因为相邻连杆天然接近，不算碰撞。
+        
+        Args:
+            q: 关节角
+            safety_margin: 安全裕度 (m)
+            skip_adjacent: 跳过的相邻连杆层数，默认 1（跳过同一连杆和直接相邻）
+        
+        Returns:
+            True 表示发生自碰撞
+        """
+        spheres = self.get_all_sphere_positions_with_link(q)
+        if len(spheres) < 2:
+            return False
+        
+        n = len(spheres)
+        for i in range(n):
+            ci, ri, li = spheres[i]
+            for j in range(i + 1, n):
+                cj, rj, lj = spheres[j]
+                # 跳过同一连杆和相邻连杆
+                if abs(li - lj) <= skip_adjacent:
+                    continue
+                dist = np.linalg.norm(ci - cj)
+                if dist < ri + rj + safety_margin:
+                    return True
+        return False
     
     def get_workspace_bounds(self) -> Dict:
         """工作空间边界"""
@@ -133,23 +232,36 @@ class XTrainerRobot:
             'z': [0, 0.6]
         }
     
-    def check_collision(self, q: np.ndarray, obstacles: List[np.ndarray]) -> bool:
-        """碰撞检测"""
+    def check_collision(self, q: np.ndarray, obstacles: List[np.ndarray] = None,
+                        safety_margin: float = 0.02,
+                        check_self: bool = True) -> bool:
+        """碰撞检测 — 外部障碍物 + 自碰撞
+        
+        1. 外部碰撞: 对每个障碍物点，检查与所有碰撞球体的距离
+        2. 自碰撞: 非相邻连杆球体之间的距离检测
+        """
         try:
-            pos, _ = self.forward_kinematics(q)
+            # 自碰撞检测
+            if check_self and self.check_self_collision(q, safety_margin=safety_margin):
+                return True
             
-            # 检查与障碍物的距离
-            for obs in obstacles:
-                dist = np.linalg.norm(pos - obs)
-                if dist < 0.05:  # 5cm 安全距离
-                    return True
-                    
-            # 检查自碰撞 (简化)
-            # 实际需要检查每个连杆
-            
+            # 外部障碍物碰撞检测
+            if obstacles:
+                spheres = self.get_all_sphere_positions(q)
+                if spheres:
+                    for obs in obstacles:
+                        for center, radius in spheres:
+                            dist = np.linalg.norm(center - obs)
+                            if dist < radius + safety_margin:
+                                return True
+                else:
+                    # 退化: 只检查末端
+                    pos, _ = self.forward_kinematics(q)
+                    for obs in obstacles:
+                        if np.linalg.norm(pos - obs) < 0.05:
+                            return True
         except:
             return True
-            
         return False
     
     def compute_end_effector_position(self, q: np.ndarray) -> np.ndarray:
@@ -158,87 +270,102 @@ class XTrainerRobot:
         return pos
 
 
-class FourierBasis:
-    """Fourier 基函数轨迹表示 (带缓存，避免重复计算)"""
+class BSplineBasis:
+    """三阶 B 样条基函数轨迹表示 (Clamped, scipy 加速)
+    
+    三阶 B 样条 (degree=3, order=4) 的优势:
+      - 局部支撑: 修改一个控制点只影响附近 4 段轨迹
+      - C² 连续: 二阶导数连续，天然平滑
+      - 凸包性: 轨迹在控制点的凸包内，便于约束处理
+      - Clamped 端点: 轨迹精确经过首尾控制点
+    
+    节点向量构造 (Clamped):
+      knots = [0,0,0,0, τ₁,τ₂,...,τ_{n-4}, 1,1,1,1]
+      两端各重复 4 次 → 轨迹精确通过首尾控制点
+    
+    使用 scipy.interpolate.BSpline 的 C 实现，比手写 Cox-de Boor 快 100+ 倍。
+    """
     
     def __init__(self, n_basis: int = 10, n_dof: int = 6, n_points: int = 100):
+        """
+        Args:
+            n_basis: 基函数个数 (=控制点个数/每个关节)，需 >= 4
+            n_dof: 自由度
+            n_points: 采样点数
+        """
+        assert n_basis >= 4, "三阶 B 样条至少需要 4 个基函数"
         self.n_basis = n_basis
         self.n_dof = n_dof
         self.n_points = n_points
+        self.degree = 3  # 三阶
+        self.order = 4   # order = degree + 1
         self.t = np.linspace(0, 1, n_points)
         
-        # 预计算并缓存所有矩阵，避免每次调用都重新生成
-        self._Phi = self._build_basis_matrix()
-        self._dPhi = self._build_velocity_matrix()
-        self._d2Phi = self._build_acceleration_matrix()
-    
-    def _build_basis_matrix(self) -> np.ndarray:
-        """构建基函数矩阵: 常数 + Hermite + Fourier
+        # 构建 clamped 节点向量
+        n_internal = n_basis - self.order  # 内部节点数
+        if n_internal > 0:
+            internal_knots = np.linspace(0, 1, n_internal + 2)[1:-1]
+        else:
+            internal_knots = np.array([])
+        self.knots = np.concatenate([
+            np.zeros(self.order),
+            internal_knots,
+            np.ones(self.order)
+        ])
         
-        列布局: [1, 3t²-2t³, sin(2πt), cos(2πt), sin(4πt), cos(4πt), ...]
-        Hermite 项 h(t)=3t²-2t³ 用于打破周期性，且端点导数为0:
-          h(0)=0, h(1)=1, h'(0)=0, h'(1)=0
+        # 预计算并缓存所有矩阵 (使用 scipy 加速)
+        self._Phi = self._build_basis_matrix_scipy()
+        self._dPhi = self._build_derivative_matrix_scipy(1)
+        self._d2Phi = self._build_derivative_matrix_scipy(2)
+    
+    def _build_basis_matrix_scipy(self) -> np.ndarray:
+        """用 scipy 构建 B 样条基函数矩阵 Φ(n_points × n_basis)
+        
+        对每个基函数 i，构造单位系数向量 e_i，用 scipy.BSpline 求值。
+        scipy 内部是 C 实现，比纯 Python 递归快 100+ 倍。
         """
         Phi = np.zeros((self.n_points, self.n_basis))
-        Phi[:, 0] = 1.0        # 常数项
-        if self.n_basis > 1:
-            Phi[:, 1] = 3*self.t**2 - 2*self.t**3  # Hermite项 (打破周期性 + 端点零速度)
-        for k in range(2, self.n_basis):
-            n = (k) // 2
-            if k % 2 == 0:  # sin
-                Phi[:, k] = np.sin(n * 2 * np.pi * self.t)
-            else:  # cos
-                Phi[:, k] = np.cos(n * 2 * np.pi * self.t)
+        for i in range(self.n_basis):
+            c = np.zeros(self.n_basis)
+            c[i] = 1.0
+            spl = SciBSpline(self.knots, c, self.degree)
+            Phi[:, i] = spl(self.t)
         return Phi
     
-    def _build_velocity_matrix(self) -> np.ndarray:
-        """构建速度基函数矩阵"""
+    def _build_derivative_matrix_scipy(self, nu: int) -> np.ndarray:
+        """用 scipy 构建 nu 阶导数矩阵
+        
+        BSpline.derivative(nu) 返回导数样条，再对 t 求值。
+        nu=1 → 速度矩阵 dΦ/dt
+        nu=2 → 加速度矩阵 d²Φ/dt²
+        """
         dPhi = np.zeros((self.n_points, self.n_basis))
-        # k=0: d(1)/dt = 0
-        if self.n_basis > 1:
-            dPhi[:, 1] = 6*self.t - 6*self.t**2  # d(3t²-2t³)/dt = 6t-6t²
-        for k in range(2, self.n_basis):
-            n = (k) // 2
-            w = n * 2 * np.pi
-            if k % 2 == 0:  # d(sin)/dt = w*cos
-                dPhi[:, k] = w * np.cos(w * self.t)
-            else:  # d(cos)/dt = -w*sin
-                dPhi[:, k] = -w * np.sin(w * self.t)
+        for i in range(self.n_basis):
+            c = np.zeros(self.n_basis)
+            c[i] = 1.0
+            spl = SciBSpline(self.knots, c, self.degree)
+            dspl = spl.derivative(nu)
+            dPhi[:, i] = dspl(self.t)
         return dPhi
     
-    def _build_acceleration_matrix(self) -> np.ndarray:
-        """构建加速度基函数矩阵"""
-        d2Phi = np.zeros((self.n_points, self.n_basis))
-        # k=0: d2(1)/dt2 = 0
-        if self.n_basis > 1:
-            d2Phi[:, 1] = 6 - 12*self.t  # d2(3t²-2t³)/dt2 = 6-12t
-        for k in range(2, self.n_basis):
-            n = (k) // 2
-            w = n * 2 * np.pi
-            if k % 2 == 0:  # d2(sin)/dt2 = -w^2*sin
-                d2Phi[:, k] = -(w**2) * np.sin(w * self.t)
-            else:  # d2(cos)/dt2 = -w^2*cos
-                d2Phi[:, k] = -(w**2) * np.cos(w * self.t)
-        return d2Phi
-        
     def basis_matrix(self) -> np.ndarray:
-        """Fourier 基函数矩阵 (缓存)"""
+        """B 样条基函数矩阵 (缓存)"""
         return self._Phi
     
     def coeffs_to_trajectory(self, c: np.ndarray) -> np.ndarray:
-        """系数 -> 轨迹"""
+        """控制点系数 -> 轨迹: traj = Φ @ c"""
         return self._Phi @ c  # (n_points, n_dof)
     
     def trajectory_to_coeffs(self, traj: np.ndarray) -> np.ndarray:
-        """轨迹 -> 系数"""
+        """轨迹 -> 控制点系数 (最小二乘拟合)"""
         return np.linalg.lstsq(self._Phi, traj, rcond=None)[0]
     
     def compute_velocity(self, c: np.ndarray) -> np.ndarray:
-        """速度"""
+        """计算速度: vel = dΦ/dt @ c"""
         return self._dPhi @ c
     
     def compute_acceleration(self, c: np.ndarray) -> np.ndarray:
-        """加速度"""
+        """计算加速度: acc = d²Φ/dt² @ c"""
         return self._d2Phi @ c
 
 
@@ -247,13 +374,13 @@ class FACTOFull:
     FACTO 完整实现 - 函数空间自适应约束轨迹优化
     
     论文核心:
-    1. Fourier 基函数表示轨迹
+    1. B 样条基函数表示轨迹
     2. 系数空间优化 (非直接优化关节角)
     3. LM + 高斯牛顿近似
     4. 约束处理 (关节限制、碰撞)
     """
     
-    def __init__(self, robot: XTrainerRobot, basis: FourierBasis):
+    def __init__(self, robot: XTrainerRobot, basis: BSplineBasis):
         self.robot = robot
         self.basis = basis
         
@@ -262,10 +389,9 @@ class FACTOFull:
         self.lam_max = 1e6
         self.lam_min = 1e-8
         
-        # 预缓存不变的雅可比矩阵
-        self._J_smooth_cache = None
-        self._J_vel_start_cache = None
-        self._J_vel_end_cache = None
+        # 预构建所有固定不变的雅可比矩阵，合并成 _J_fixed
+        # 固定残差 = _J_fixed @ coeffs_flat (无常数项部分)
+        self._build_fixed_jacobian()
         
     def optimize(self,
                 start: np.ndarray,
@@ -275,17 +401,15 @@ class FACTOFull:
         """
         FACTO 优化
         """
-        # 重置缓存和阻尼因子
-        self._J_smooth_cache = None
-        self._J_vel_start_cache = None
-        self._J_vel_end_cache = None
+        # 重置阻尼因子
         self.lam = 0.01
         
         # 初始化: Hermite 插值 (3t²-2t³) 作为初始轨迹
-        # 与基函数中的 Hermite 项匹配，端点速度天然为0，不会泄漏到谐波分量
+        # h(0)=0, h(1)=1, h'(0)=0, h'(1)=0
+        # 拟合到 B 样条后，首尾控制点收拢，端点速度近似为 0
         n_dof = self.robot.n_dof
         t = np.linspace(0, 1, self.basis.n_points)
-        h = 3*t**2 - 2*t**3  # Hermite 插值: h(0)=0, h(1)=1, h'(0)=0, h'(1)=0
+        h = 3*t**2 - 2*t**3
         traj_init = np.zeros((self.basis.n_points, n_dof))
         for i in range(n_dof):
             traj_init[:, i] = start[i] + h * (goal[i] - start[i])
@@ -308,11 +432,10 @@ class FACTOFull:
             except:
                 delta = np.linalg.lstsq(H, grad, rcond=None)[0]
             
-            coeffs_new = coeffs - delta.reshape(coeffs.shape)
+            coeffs_new = coeffs - delta.reshape(coeffs.shape, order='F')
             
-            # 接受/拒绝 (用残差平方和作为目标函数，而非残差和)
-            traj_new = self.basis.coeffs_to_trajectory(coeffs_new)
-            cost_new, _ = self._compute_cost(coeffs_new, start, goal, obstacles)
+            # 接受/拒绝 (只算残差，不算雅可比，节省约一半计算量)
+            cost_new = self._compute_residuals_only(coeffs_new, start, goal, obstacles)
             
             if np.sum(cost_new**2) < np.sum(cost**2):
                 coeffs = coeffs_new
@@ -328,126 +451,227 @@ class FACTOFull:
         
         return final_traj, {'iterations': it + 1, 'final_cost': np.sum(cost**2)}
     
-    def _compute_cost(self, coeffs: np.ndarray, start: np.ndarray, goal: np.ndarray,
-                     obstacles: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-        """计算成本向量和雅可比矩阵"""
+    def _build_fixed_jacobian(self):
+        """预构建所有固定不变的雅可比矩阵，合并成 _J_fixed
         
+        固定部分包括: 平滑度 + 终点 + 起点 + 速度边界
+        这些的雅可比矩阵不依赖 coeffs，只需构建一次。
+        
+        _J_fixed: (N_fixed, n_coeffs) 合并后的固定雅可比
+        _b_goal_rows / _b_start_rows: 常数项索引，用于高效计算残差
+        """
+        n = self.basis.n_points
+        n_dof = self.robot.n_dof
+        n_basis = self.basis.n_basis
+        n_coeffs = n_basis * n_dof
+        
+        rows = []
+        
+        # 1. 平滑度 (n*n_dof 行)
+        J_smooth = np.zeros((n * n_dof, n_coeffs))
+        for j in range(n_dof):
+            J_smooth[j*n:(j+1)*n, j*n_basis:(j+1)*n_basis] = self.basis._d2Phi * 0.1
+        rows.append(J_smooth)
+        self._smooth_end = n * n_dof
+        
+        # 2. 终点 (n_dof 行)
+        J_end = np.zeros((n_dof, n_coeffs))
+        Phi_end = self.basis._Phi[-1, :]
+        for j in range(n_dof):
+            J_end[j, j*n_basis:(j+1)*n_basis] = Phi_end * 50
+        rows.append(J_end)
+        
+        # 3. 起点 (n_dof 行)
+        J_start = np.zeros((n_dof, n_coeffs))
+        Phi_start = self.basis._Phi[0, :]
+        for j in range(n_dof):
+            J_start[j, j*n_basis:(j+1)*n_basis] = Phi_start * 50
+        rows.append(J_start)
+        
+        # 4. 速度边界 — 起点 (n_dof 行)
+        J_vel_s = np.zeros((n_dof, n_coeffs))
+        dPhi_0 = self.basis._dPhi[0]
+        for j in range(n_dof):
+            J_vel_s[j, j*n_basis:(j+1)*n_basis] = dPhi_0 * 5.0
+        rows.append(J_vel_s)
+        
+        # 5. 速度边界 — 终点 (n_dof 行)
+        J_vel_e = np.zeros((n_dof, n_coeffs))
+        dPhi_m1 = self.basis._dPhi[-1]
+        for j in range(n_dof):
+            J_vel_e[j, j*n_basis:(j+1)*n_basis] = dPhi_m1 * 5.0
+        rows.append(J_vel_e)
+        
+        self._J_fixed = np.vstack(rows)  # (N_fixed, n_coeffs)
+        self._n_fixed = self._J_fixed.shape[0]
+        
+        # 预计算 J_fixed^T @ J_fixed (这在所有迭代中不变)
+        self._JtJ_fixed = self._J_fixed.T @ self._J_fixed
+        
+        # 常数项偏移索引（用于 goal/start 的残差计算）
+        self._goal_slice = slice(self._smooth_end, self._smooth_end + n_dof)
+        self._start_slice = slice(self._smooth_end + n_dof, self._smooth_end + 2*n_dof)
+    
+    def _compute_fixed_residuals(self, coeffs_flat: np.ndarray,
+                                 start: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        """高效计算固定部分的残差向量
+        
+        res_fixed = J_fixed @ coeffs_flat + b
+        其中 b 只在 goal/start 对应的行有值。
+        """
+        res = self._J_fixed @ coeffs_flat
+        # 终点残差需要减去 goal * 50
+        res[self._goal_slice] -= goal * 50
+        # 起点残差需要减去 start * 50
+        res[self._start_slice] -= start * 50
+        return res
+    
+    def _compute_residuals_only(self, coeffs: np.ndarray, start: np.ndarray,
+                                goal: np.ndarray, obstacles: List[np.ndarray]) -> np.ndarray:
+        """只计算残差向量（不计算雅可比），用于接受/拒绝判断"""
+        coeffs_flat = coeffs.flatten(order='F')
         traj = self.basis.coeffs_to_trajectory(coeffs)
-        acc = self.basis.compute_acceleration(coeffs)
         
-        residuals = []
-        J_rows = []
+        # 固定部分 (一次矩阵乘法)
+        res_list = [self._compute_fixed_residuals(coeffs_flat, start, goal)]
         
-        # 1. 平滑度成本 (加速度平方) - 权重提升到 0.1 以抑制高频波动
-        res_smooth = acc.flatten() * 0.1
-        if self._J_smooth_cache is None:
-            self._J_smooth_cache = self._jacobian_smooth()
-        residuals.extend(res_smooth)
-        J_rows.append(self._J_smooth_cache)
-        
-        # 2. 末端误差 (终点) - 权重50，确保终点精度
-        res_end = (traj[-1] - goal) * 50
-        J_end = self._jacobian_end(coeffs)
-        residuals.extend(res_end)
-        J_rows.append(J_end)
-        
-        # 2.5 起始点约束 - 权重50，确保起点精度
-        res_start = (traj[0] - start) * 50
-        J_start = self._jacobian_start(coeffs)
-        residuals.extend(res_start)
-        J_rows.append(J_start)
-        
-        # 2.6 速度边界约束 - 权重5.0，起止速度为0
-        vel = self.basis.compute_velocity(coeffs)
-        res_vel_start = vel[0] * 5.0   # 起点速度应为0
-        res_vel_end = vel[-1] * 5.0     # 终点速度应为0
-        if self._J_vel_start_cache is None:
-            self._J_vel_start_cache = self._jacobian_velocity_boundary(0)
-            self._J_vel_end_cache = self._jacobian_velocity_boundary(-1)
-        residuals.extend(res_vel_start)
-        J_rows.append(self._J_vel_start_cache)
-        residuals.extend(res_vel_end)
-        J_rows.append(self._J_vel_end_cache)
-        
-        # 3. 关节限制
-        for i, q in enumerate(traj[::5]):  # 每5个点检查一次
+        # 动态部分: 关节限制
+        dyn = []
+        for i, q in enumerate(traj[::5]):
             for j in range(self.robot.n_dof):
                 if q[j] < self.robot.joint_limits[j, 0] + 0.1:
-                    res = (self.robot.joint_limits[j, 0] + 0.1 - q[j]) * 5
-                    residuals.append(res)
-                    J_rows.append(self._jacobian_joint_violation(i*5, j, coeffs))
+                    dyn.append((self.robot.joint_limits[j, 0] + 0.1 - q[j]) * 5)
                 elif q[j] > self.robot.joint_limits[j, 1] - 0.1:
-                    res = (q[j] - (self.robot.joint_limits[j, 1] - 0.1)) * 5
-                    residuals.append(res)
-                    J_rows.append(self._jacobian_joint_violation(i*5, j, coeffs))
+                    dyn.append((q[j] - (self.robot.joint_limits[j, 1] - 0.1)) * 5)
         
-        # 4. 障碍物避让
+        # 障碍物
         if obstacles:
+            has_spheres = bool(self.robot.collision_spheres)
             for obs in obstacles:
-                for i, q in enumerate(traj):
+                for i in range(0, len(traj), 5):
                     try:
-                        pos = self.robot.compute_end_effector_position(q)
-                        dist = np.linalg.norm(pos - obs)
-                        if dist < 0.08:
-                            res = (0.08 - dist) * 20
-                            residuals.append(res)
-                            J_rows.append(self._jacobian_obstacle(i, obs, coeffs))
+                        if has_spheres:
+                            for center, radius in self.robot.get_all_sphere_positions(traj[i]):
+                                dist = np.linalg.norm(center - obs)
+                                margin = radius + 0.03
+                                if dist < margin:
+                                    dyn.append((margin - dist) * 20)
+                        else:
+                            pos = self.robot.compute_end_effector_position(traj[i])
+                            dist = np.linalg.norm(pos - obs)
+                            if dist < 0.08:
+                                dyn.append((0.08 - dist) * 20)
                     except:
                         pass
         
-        residual_vec = np.array(residuals)
-        J_matrix = np.vstack(J_rows) if J_rows else np.zeros((0, coeffs.size))
+        # 自碰撞
+        if self.robot.collision_spheres:
+            for i in range(0, len(traj), 10):
+                try:
+                    spheres = self.robot.get_all_sphere_positions_with_link(traj[i])
+                    n_s = len(spheres)
+                    for si in range(n_s):
+                        ci, ri, li = spheres[si]
+                        for sj in range(si + 1, n_s):
+                            cj, rj, lj = spheres[sj]
+                            if abs(li - lj) <= 1:
+                                continue
+                            dist = np.linalg.norm(ci - cj)
+                            margin = ri + rj + 0.02
+                            if dist < margin:
+                                dyn.append((margin - dist) * 15)
+                except:
+                    pass
+        
+        if dyn:
+            res_list.append(np.array(dyn))
+        return np.concatenate(res_list)
+    
+    def _compute_cost(self, coeffs: np.ndarray, start: np.ndarray, goal: np.ndarray,
+                     obstacles: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+        """计算成本向量和雅可比矩阵
+        
+        固定部分（平滑度+端点+起点+速度边界）使用预缓存的 _J_fixed。
+        动态部分（关节限制+碰撞）逐项追加。
+        """
+        coeffs_flat = coeffs.flatten(order='F')
+        traj = self.basis.coeffs_to_trajectory(coeffs)
+        
+        # 固定部分残差
+        res_fixed = self._compute_fixed_residuals(coeffs_flat, start, goal)
+        
+        # 动态部分
+        dyn_res = []
+        dyn_J = []
+        
+        # 关节限制
+        for i, q in enumerate(traj[::5]):
+            for j in range(self.robot.n_dof):
+                if q[j] < self.robot.joint_limits[j, 0] + 0.1:
+                    dyn_res.append((self.robot.joint_limits[j, 0] + 0.1 - q[j]) * 5)
+                    dyn_J.append(self._jacobian_joint_violation(i*5, j, coeffs))
+                elif q[j] > self.robot.joint_limits[j, 1] - 0.1:
+                    dyn_res.append((q[j] - (self.robot.joint_limits[j, 1] - 0.1)) * 5)
+                    dyn_J.append(self._jacobian_joint_violation(i*5, j, coeffs))
+        
+        # 障碍物避让
+        if obstacles:
+            has_spheres = bool(self.robot.collision_spheres)
+            for obs in obstacles:
+                for i in range(0, len(traj), 5):
+                    try:
+                        if has_spheres:
+                            for center, radius in self.robot.get_all_sphere_positions(traj[i]):
+                                dist = np.linalg.norm(center - obs)
+                                margin = radius + 0.03
+                                if dist < margin:
+                                    dyn_res.append((margin - dist) * 20)
+                                    dyn_J.append(self._jacobian_obstacle(i, obs, coeffs))
+                        else:
+                            pos = self.robot.compute_end_effector_position(traj[i])
+                            dist = np.linalg.norm(pos - obs)
+                            if dist < 0.08:
+                                dyn_res.append((0.08 - dist) * 20)
+                                dyn_J.append(self._jacobian_obstacle(i, obs, coeffs))
+                    except:
+                        pass
+        
+        # 自碰撞避让
+        if self.robot.collision_spheres:
+            for i in range(0, len(traj), 10):
+                try:
+                    spheres = self.robot.get_all_sphere_positions_with_link(traj[i])
+                    n_s = len(spheres)
+                    for si in range(n_s):
+                        ci, ri, li = spheres[si]
+                        for sj in range(si + 1, n_s):
+                            cj, rj, lj = spheres[sj]
+                            if abs(li - lj) <= 1:
+                                continue
+                            dist = np.linalg.norm(ci - cj)
+                            margin = ri + rj + 0.02
+                            if dist < margin:
+                                dyn_res.append((margin - dist) * 15)
+                                dyn_J.append(self._jacobian_self_collision(i, coeffs))
+                except:
+                    pass
+        
+        # 合并
+        if dyn_res:
+            dyn_res_arr = np.array(dyn_res)
+            dyn_J_arr = np.vstack(dyn_J)
+            residual_vec = np.concatenate([res_fixed, dyn_res_arr])
+            J_matrix = np.vstack([self._J_fixed, dyn_J_arr])
+        else:
+            residual_vec = res_fixed
+            J_matrix = self._J_fixed
         
         return residual_vec, J_matrix
-    
-    def _jacobian_smooth(self) -> np.ndarray:
-        """平滑度雅可比 (使用缓存的加速度矩阵)"""
-        n = self.basis.n_points
-        n_dof = self.robot.n_dof
-        d2Phi = self.basis._d2Phi  # 直接使用缓存
-        
-        J = np.zeros((n * n_dof, self.basis.n_basis * n_dof))
-        
-        for j in range(n_dof):
-            J[j*n:(j+1)*n, j*self.basis.n_basis:(j+1)*self.basis.n_basis] = d2Phi * 0.1
-        
-        return J
-        
-    def _jacobian_end(self, coeffs: np.ndarray) -> np.ndarray:
-        """末端雅可比（终点）"""
-        n_dof = self.robot.n_dof
-        J = np.zeros((n_dof, coeffs.size))
-        Phi_end = self.basis.basis_matrix()[-1, :]
-        for j in range(n_dof):
-            J[j, j*self.basis.n_basis:(j+1)*self.basis.n_basis] = Phi_end * 50
-        return J
-    
-    def _jacobian_start(self, coeffs: np.ndarray) -> np.ndarray:
-        """起始点雅可比 - 约束 traj[0] == start"""
-        n_dof = self.robot.n_dof
-        J = np.zeros((n_dof, coeffs.size))
-        Phi_start = self.basis.basis_matrix()[0, :]
-        for j in range(n_dof):
-            J[j, j*self.basis.n_basis:(j+1)*self.basis.n_basis] = Phi_start * 50
-        return J
-    
-    def _jacobian_velocity_boundary(self, time_idx: int) -> np.ndarray:
-        """速度边界雅可比 - 约束端点速度为0"""
-        n_dof = self.robot.n_dof
-        n_basis = self.basis.n_basis
-        
-        # 直接使用缓存的速度矩阵，保证与基函数布局一致
-        dPhi_row = self.basis._dPhi[time_idx]
-        
-        J = np.zeros((n_dof, n_basis * n_dof))
-        for j in range(n_dof):
-            J[j, j*n_basis:(j+1)*n_basis] = dPhi_row * 5.0
-        return J
     
     def _jacobian_joint_violation(self, traj_idx: int, joint_idx: int, coeffs: np.ndarray) -> np.ndarray:
         """关节限制违反的雅可比"""
         J = np.zeros(coeffs.size)
-        Phi_row = self.basis.basis_matrix()[traj_idx, :]
+        Phi_row = self.basis._Phi[traj_idx, :]
         J[joint_idx * self.basis.n_basis:(joint_idx+1) * self.basis.n_basis] = Phi_row * 5
         return J
     
@@ -455,6 +679,52 @@ class FACTOFull:
         """障碍物避让雅可比"""
         # 简化实现
         return np.zeros(coeffs.size)
+    
+    def _jacobian_self_collision(self, traj_idx: int, coeffs: np.ndarray) -> np.ndarray:
+        """自碰撞雅可比 — 数值差分
+        
+        对各关节微扰 δq，观察自碰撞残差的变化。
+        虽然比解析雅可比慢，但实现简单且正确。
+        """
+        eps = 1e-4
+        n_dof = self.robot.n_dof
+        n_basis = self.basis.n_basis
+        Phi_row = self.basis.basis_matrix()[traj_idx, :]  # (n_basis,)
+        
+        # 自碰撞梯度近似: 对每个关节 j 求 d(min_dist)/dq_j
+        traj = self.basis.coeffs_to_trajectory(coeffs)
+        q0 = traj[traj_idx]
+        
+        # 当前最小距离
+        d0 = self._min_self_collision_dist(q0)
+        
+        J = np.zeros(coeffs.size)
+        for j in range(n_dof):
+            q_pert = q0.copy()
+            q_pert[j] += eps
+            d_pert = self._min_self_collision_dist(q_pert)
+            # d(margin - dist)/dq_j = -d(dist)/dq_j
+            grad_j = -(d_pert - d0) / eps
+            # 链式法则: d_residual/d_coeffs_j = grad_j * Phi_row * weight
+            J[j * n_basis:(j + 1) * n_basis] = grad_j * Phi_row * 15
+        
+        return J
+    
+    def _min_self_collision_dist(self, q: np.ndarray) -> float:
+        """计算非相邻连杆球体之间的最小距离"""
+        spheres = self.robot.get_all_sphere_positions_with_link(q)
+        min_dist = float('inf')
+        n_s = len(spheres)
+        for si in range(n_s):
+            ci, ri, li = spheres[si]
+            for sj in range(si + 1, n_s):
+                cj, rj, lj = spheres[sj]
+                if abs(li - lj) <= 1:
+                    continue
+                dist = np.linalg.norm(ci - cj) - ri - rj
+                if dist < min_dist:
+                    min_dist = dist
+        return min_dist
 
 
 class TimeParameterizer:
@@ -698,11 +968,17 @@ def test():
     print("FACTO 完整版 - XTrainer 机械臂")
     print("=" * 50)
     
-    # 创建机器人
-    robot = XTrainerRobot()
+    # 加载碰撞球体配置
+    yml_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xtrainer.yml')
+    collision_spheres = load_collision_spheres(yml_path)
+    print(f"加载碰撞球体: {sum(len(v) for v in collision_spheres.values())} 个, "
+          f"覆盖 {len(collision_spheres)} 个连杆")
     
-    # Fourier 基函数
-    basis = FourierBasis(n_basis=10, n_dof=6, n_points=80)
+    # 创建机器人
+    robot = XTrainerRobot(collision_spheres=collision_spheres)
+    
+    # B 样条基函数 (三阶, 10个控制点)
+    basis = BSplineBasis(n_basis=10, n_dof=6, n_points=80)
     
     # FACTO 优化器
     facto = FACTOFull(robot, basis)

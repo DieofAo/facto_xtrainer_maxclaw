@@ -27,7 +27,7 @@ collision_spheres:
     - center: [-0.108, 0.0, -0.0]
       radius: 0.07
     - center: [-0.217, 0.0, -0.0]
-      radius: 0.07
+      radius: 0.05
   LINK_4:
     - center: [-0.0, 0.0, -0.015]
       radius: 0.06

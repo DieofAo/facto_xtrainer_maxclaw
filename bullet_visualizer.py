@@ -18,7 +18,7 @@ import numpy as np
 import time
 import os
 
-from facto_xtrainer import XTrainerRobot, FourierBasis, FACTOFull, TimeParameterizer
+from facto_xtrainer import XTrainerRobot, BSplineBasis, FACTOFull, TimeParameterizer
 
 
 class BulletVisualizer:
@@ -203,7 +203,7 @@ def main():
 
     # ---- 1. FACTO 轨迹规划 ----
     robot = XTrainerRobot()
-    basis = FourierBasis(n_basis=10, n_dof=6, n_points=80)
+    basis = BSplineBasis(n_basis=10, n_dof=6, n_points=80)
     facto = FACTOFull(robot, basis)
     timer = TimeParameterizer(robot.joint_velocity_limits, cruise_ratio=0.8)
 
